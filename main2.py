@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, text
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import hashlib
 from winotify import Notification, audio  
 import traceback
@@ -13,8 +13,11 @@ import subprocess
 
 # Initialize notification settings
 app_name = "Attendance Monitor"
-icon_path = r"C:\Users\Calibrage60\Desktop\monitor\logo.png"  
-monitor_folder = r"C:\Users\Calibrage60\Desktop\monitor\data"
+icon_path = r"E:\monitor\monitor1\logo.png"  
+monitor_folder = r"E:\monitor\monitor1\data"
+
+# Indian Standard Time (IST) Offset
+IST = timezone(timedelta(hours=5, minutes=30))
 
 def open_folder():
     subprocess.Popen(f'explorer "{monitor_folder}"')
@@ -22,9 +25,9 @@ def open_folder():
 class DatabaseManager:
     def __init__(self, db_connection_string):
         self.db_engine = create_engine(db_connection_string, connect_args={'sslmode': 'require'})
-        self.create_table()
+        self.create_tables()
     
-    def create_table(self):
+    def create_tables(self):
         create_table_query = """
         CREATE TABLE IF NOT EXISTS biometric_attendance (
             id SERIAL PRIMARY KEY,
@@ -35,17 +38,39 @@ class DatabaseManager:
             Punch_In_Time TIME,
             Punch_Out_Time TIME,
             Shift_Out TIME,
-            Hours_Worked NUMERIC(5,2),
+            Hours_Worked VARCHAR(8),
             Status VARCHAR(50),
             Late_By TIME,
             file_hash VARCHAR(64),
             processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        
+        CREATE TABLE IF NOT EXISTS logs (
+            id SERIAL PRIMARY KEY,
+            event_type VARCHAR(50),
+            event_description TEXT,
+            file_name VARCHAR(255),
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """
         with self.db_engine.connect() as conn:
             conn.execute(text(create_table_query))
             conn.commit()
-        print("Successfully connected to Aiven PostgreSQL and table created if needed")
+        print("Successfully connected to Aiven PostgreSQL and tables created if needed")
+    
+    def log_event(self, event_type, event_description, file_name):
+        log_query = """
+        INSERT INTO logs (event_type, event_description, file_name, timestamp) 
+        VALUES (:event_type, :event_description, :file_name, :timestamp);
+        """
+        with self.db_engine.connect() as conn:
+            conn.execute(text(log_query), {
+                'event_type': event_type,
+                'event_description': event_description,
+                'file_name': file_name,
+                'timestamp': datetime.now(IST)
+            })
+            conn.commit()
     
     def check_file_processed(self, file_hash):
         query = "SELECT EXISTS(SELECT 1 FROM biometric_attendance WHERE file_hash = :file_hash);"
@@ -53,16 +78,18 @@ class DatabaseManager:
             return conn.execute(text(query), {'file_hash': file_hash}).scalar()
     
     def convert_time_to_hours(self, time_str):
-        if pd.isna(time_str):
+        if pd.isna(time_str) or time_str is None:
             return None
         try:
             if isinstance(time_str, str):
                 hours, minutes, seconds = map(int, time_str.split(':'))
-            else:
+            elif isinstance(time_str, (datetime.time, pd.Timestamp)):
                 hours = time_str.hour
                 minutes = time_str.minute
                 seconds = time_str.second
-            return round(hours + minutes/60 + seconds/3600, 2)
+            else:
+                return None
+            return round(hours + minutes / 60 + seconds / 3600, 2)
         except (ValueError, AttributeError):
             return None
     
@@ -88,7 +115,7 @@ class DatabaseManager:
                     'Punch_In_Time': row['Punch_In_Time'] if pd.notna(row['Punch_In_Time']) else None,
                     'Punch_Out_Time': row['Punch_Out_Time'] if pd.notna(row['Punch_Out_Time']) else None,
                     'Shift_Out': row['Shift_Out'] if pd.notna(row['Shift_Out']) else None,
-                    'Hours_Worked': hours_worked,
+                    'Hours_Worked': row['Hours_Worked'],
                     'Status': row['Status'],
                     'Late_By': row['Late_By'] if pd.notna(row['Late_By']) else None,
                     'file_hash': file_hash
@@ -110,71 +137,33 @@ class ExcelHandler(FileSystemEventHandler):
     def process_excel_file(self, file_path):
         try:
             file_hash = self.calculate_file_hash(file_path)
+            file_name = os.path.basename(file_path)
+            
             if self.db_manager.check_file_processed(file_hash):
-                print(f"File {file_path} was already processed. Skipping...")
-                toast = Notification(
-                    app_id=app_name,
-                    title="File Skipped",
-                    msg=f"File {os.path.basename(file_path)} was already processed.",
-                    icon=icon_path
-                )
-                toast.show()
+                print(f"File {file_name} was already processed. Skipping...")
+                self.db_manager.log_event("Skipped", "File already processed", file_name)
                 return
             
-            print(f"Reading file: {file_path}")
-            toast = Notification(
-                app_id=app_name,
-                title="Processing File",
-                msg=f"Processing: {os.path.basename(file_path)}",
-                icon=icon_path
-            )
-            toast.show()
+            print(f"Processing file: {file_name}")
+            self.db_manager.log_event("Processing", "Started processing file", file_name)
             
             df = pd.read_excel(file_path, header=1)
-            print("Processing data with columns:", df.columns.tolist())
             df['Punch_Date'] = pd.to_datetime(df['Punch_Date']).dt.date
-            
             time_columns = ['Shift_In', 'Punch_In_Time', 'Punch_Out_Time', 'Shift_Out', 'Late_By']
             for col in time_columns:
                 df[col] = pd.to_datetime(df[col], format='%H:%M:%S', errors='coerce').dt.time
             
             self.db_manager.insert_attendance_data(df, file_hash)
-            print(f"Successfully processed file: {file_path}")
-            
-            # Show success notification
-            toast = Notification(
-                app_id=app_name,
-                title="File Processed",
-                msg=f"Successfully processed: {os.path.basename(file_path)}",
-                icon=icon_path
-            )
-            toast.add_actions("View Folder", open_folder)
-            toast.show()
-            
+            self.db_manager.log_event("Success", "File processed successfully", file_name)
+            print(f"Successfully processed file: {file_name}")
+        
         except Exception as e:
-            print(f"Error processing file {file_path}: {str(e)}")
+            error_message = str(e)
+            self.db_manager.log_event("Error", error_message, file_name)
             traceback.print_exc()
-            toast = Notification(
-                app_id=app_name,
-                title="Processing Error",
-                msg=f"Error processing: {os.path.basename(file_path)}\nClick to retry",
-                icon=icon_path
-            )
-            # Add sound for error notifications
-            toast.set_audio(audio.Default, loop=False)
-            toast.add_actions("Retry", open_folder)
-            toast.show()
 
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith('.xlsx'):
-            print(f"New Excel file detected: {event.src_path}")
-            toast = Notification(
-                app_id=app_name,
-                title="New File Detected",
-                msg=f"New file: {os.path.basename(event.src_path)} detected!",
-                icon=icon_path
-            )
-            toast.show()
             time.sleep(1)
             self.process_excel_file(event.src_path)
 
@@ -188,27 +177,12 @@ def main():
     observer.start()
     
     print(f"Started monitoring folder: {monitor_folder}")
-    toast = Notification(
-        app_id=app_name,
-        title="Monitoring Started",
-        msg=f"Watching folder: {monitor_folder}",
-        icon=icon_path
-    )
-    toast.show()
-
+    
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
-        print("Stopping service...")
-        toast = Notification(
-            app_id=app_name,
-            title="Service Stopped",
-            msg="File monitoring service has been stopped.",
-            icon=icon_path
-        )
-        toast.show()
     observer.join()
 
 if __name__ == "__main__":
