@@ -1,0 +1,5 @@
+pandas
+psycopg2
+sqlalchemy
+watchdog
+winotify    #pip install -r requirements.txt
