@@ -77,22 +77,6 @@ class DatabaseManager:
         with self.db_engine.connect() as conn:
             return conn.execute(text(query), {'file_hash': file_hash}).scalar()
     
-    def convert_time_to_hours(self, time_str):
-        if pd.isna(time_str) or time_str is None:
-            return None
-        try:
-            if isinstance(time_str, str):
-                hours, minutes, seconds = map(int, time_str.split(':'))
-            elif isinstance(time_str, (datetime.time, pd.Timestamp)):
-                hours = time_str.hour
-                minutes = time_str.minute
-                seconds = time_str.second
-            else:
-                return None
-            return round(hours + minutes / 60 + seconds / 3600, 2)
-        except (ValueError, AttributeError):
-            return None
-    
     def insert_attendance_data(self, df, file_hash):
         insert_query = """
         INSERT INTO biometric_attendance (
@@ -100,24 +84,31 @@ class DatabaseManager:
             Punch_In_Time, Punch_Out_Time, Shift_Out, Hours_Worked, 
             Status, Late_By, file_hash
         ) VALUES (
-            :Punch_Date, :Employee_ID, :Employee_Name, :Shift_In, :Punch_In_Time, :Punch_Out_Time, 
-            :Shift_Out, :Hours_Worked, :Status, :Late_By, :file_hash
+            :Punch_Date, :Employee_ID, :Employee_Name, :Shift_In, 
+            :Punch_In_Time, :Punch_Out_Time, :Shift_Out, :Hours_Worked, 
+            :Status, :Late_By, :file_hash
         );
         """
         with self.db_engine.connect() as conn:
             for _, row in df.iterrows():
-                hours_worked = self.convert_time_to_hours(row['Hours_Worked'])
+                # Convert time objects to strings for database insertion
+                shift_in = str(row['Shift_In']) if pd.notna(row['Shift_In']) else None
+                shift_out = str(row['Shift_Out']) if pd.notna(row['Shift_Out']) else None
+                punch_in = str(row['Punch_In_Time']) if pd.notna(row['Punch_In_Time']) else None
+                punch_out = str(row['Punch_Out_Time']) if pd.notna(row['Punch_Out_Time']) else None
+                late_by = str(row['Late_By']) if pd.notna(row['Late_By']) else None
+
                 values = {
                     'Punch_Date': row['Punch_Date'],
                     'Employee_ID': row['Employee_ID'],
                     'Employee_Name': row['Employee_Name'],
-                    'Shift_In': row['Shift_In'] if pd.notna(row['Shift_In']) else None,
-                    'Punch_In_Time': row['Punch_In_Time'] if pd.notna(row['Punch_In_Time']) else None,
-                    'Punch_Out_Time': row['Punch_Out_Time'] if pd.notna(row['Punch_Out_Time']) else None,
-                    'Shift_Out': row['Shift_Out'] if pd.notna(row['Shift_Out']) else None,
+                    'Shift_In': shift_in,
+                    'Punch_In_Time': punch_in,
+                    'Punch_Out_Time': punch_out,
+                    'Shift_Out': shift_out,
                     'Hours_Worked': row['Hours_Worked'],
                     'Status': row['Status'],
-                    'Late_By': row['Late_By'] if pd.notna(row['Late_By']) else None,
+                    'Late_By': late_by,
                     'file_hash': file_hash
                 }
                 conn.execute(text(insert_query), values)
@@ -149,9 +140,12 @@ class ExcelHandler(FileSystemEventHandler):
             
             df = pd.read_excel(file_path, header=1)
             df['Punch_Date'] = pd.to_datetime(df['Punch_Date']).dt.date
+            
+            # Modified time column handling
             time_columns = ['Shift_In', 'Punch_In_Time', 'Punch_Out_Time', 'Shift_Out', 'Late_By']
             for col in time_columns:
-                df[col] = pd.to_datetime(df[col], format='%H:%M:%S', errors='coerce').dt.time
+                # Convert to string first to handle any potential NaT values
+                df[col] = pd.to_datetime(df[col].astype(str), format='%H:%M:%S', errors='coerce').dt.time
             
             self.db_manager.insert_attendance_data(df, file_hash)
             self.db_manager.log_event("Success", "File processed successfully", file_name)
