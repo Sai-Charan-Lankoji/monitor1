@@ -10,7 +10,6 @@ import hashlib
 from winotify import Notification, audio  
 import traceback
 import subprocess
-import hupper  # Import hupper for hot-reloading
 
 # Initialize notification settings
 app_name = "Attendance Monitor"
@@ -44,15 +43,26 @@ class DatabaseManager:
             Status VARCHAR(50),
             Late_By TIME,
             file_hash VARCHAR(64),
-            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT unique_employee_record UNIQUE (Punch_Date, Employee_ID)
         );
         
+        CREATE TABLE IF NOT EXISTS duplicate_records_log (
+            id SERIAL PRIMARY KEY,
+            Punch_Date DATE,
+            Employee_ID VARCHAR(50),
+            Employee_Name VARCHAR(100),
+            file_name VARCHAR(255),
+            logged_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            reason TEXT  -- Changed from VARCHAR(255) to TEXT to handle longer error messages
+        );
+
         CREATE TABLE IF NOT EXISTS logs (
-        id SERIAL PRIMARY KEY,
-        event_type VARCHAR(50),
-        event_description TEXT,
-        file_name VARCHAR(255),
-        timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            id SERIAL PRIMARY KEY,
+            event_type VARCHAR(50),
+            event_description TEXT,
+            file_name VARCHAR(255),
+            timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
         """
         with self.db_engine.connect() as conn:
@@ -60,6 +70,23 @@ class DatabaseManager:
             conn.commit()
         print("Successfully connected to Aiven PostgreSQL and tables created if needed")
     
+    def log_duplicate_record(self, row, file_name, reason):
+        log_query = """
+        INSERT INTO duplicate_records_log 
+        (Punch_Date, Employee_ID, Employee_Name, file_name, reason, logged_at) 
+        VALUES (:punch_date, :employee_id, :employee_name, :file_name, :reason, :logged_at AT TIME ZONE 'Asia/Kolkata');
+        """
+        with self.db_engine.connect() as conn:
+            conn.execute(text(log_query), {
+                'punch_date': row['Punch_Date'],
+                'employee_id': str(row['Employee_ID']).strip(),
+                'employee_name': row['Employee_Name'],
+                'file_name': file_name,
+                'reason': reason,
+                'logged_at': datetime.now(IST)
+            })
+            conn.commit()
+
     def log_event(self, event_type, event_description, file_name):
         log_query = """
         INSERT INTO logs (event_type, event_description, file_name, timestamp) 
@@ -73,28 +100,35 @@ class DatabaseManager:
                 'timestamp': datetime.now(IST)
             })
             conn.commit()
-        
-    def check_file_processed(self, file_hash):
-        query = "SELECT EXISTS(SELECT 1 FROM biometric_attendance WHERE file_hash = :file_hash);"
+    
+    def check_duplicate_record(self, punch_date, employee_id):
+        check_query = """
+        SELECT EXISTS(
+            SELECT 1 FROM biometric_attendance 
+            WHERE Punch_Date = :punch_date 
+            AND Employee_ID = :employee_id
+        );
+        """
         with self.db_engine.connect() as conn:
-            return conn.execute(text(query), {'file_hash': file_hash}).scalar()
-    
-    def convert_time_to_hours(self, time_str):
-        if pd.isna(time_str) or time_str is None:
-            return None
-        try:
-            if isinstance(time_str, str):
-                hours, minutes, seconds = map(int, time_str.split(':'))
-            elif isinstance(time_str, (datetime.time, pd.Timestamp)):
-                hours = time_str.hour
-                minutes = time_str.minute
-                seconds = time_str.second
-            else:
-                return None
-            return round(hours + minutes / 60 + seconds / 3600, 2)
-        except (ValueError, AttributeError):
-            return None
-    
+            result = conn.execute(text(check_query), {
+                'punch_date': punch_date,
+                'employee_id': employee_id
+            }).scalar()
+            return result
+
+    def get_existing_record(self, punch_date, employee_id):
+        query = """
+        SELECT * FROM biometric_attendance 
+        WHERE Punch_Date = :punch_date 
+        AND Employee_ID = :employee_id;
+        """
+        with self.db_engine.connect() as conn:
+            result = conn.execute(text(query), {
+                'punch_date': punch_date,
+                'employee_id': employee_id
+            }).fetchone()
+            return result
+
     def insert_attendance_data(self, df, file_hash, file_name):
         insert_query = """
         INSERT INTO biometric_attendance (
@@ -106,27 +140,61 @@ class DatabaseManager:
             :Shift_Out, :Hours_Worked, :Status, :Late_By, :file_hash
         );
         """
+        
+        successful_inserts = 0
+        total_records = len(df)
+        
         with self.db_engine.connect() as conn:
             for _, row in df.iterrows():
-                if pd.notna(row['Employee_ID']) and len(str(row['Employee_ID']).strip()) == 8:
-                    hours_worked = self.convert_time_to_hours(row['Hours_Worked'])
-                    values = {
-                        'Punch_Date': row['Punch_Date'],
-                        'Employee_ID': str(row['Employee_ID']).strip(),
-                        'Employee_Name': row['Employee_Name'],
-                        'Shift_In': row['Shift_In'] if pd.notna(row['Shift_In']) else None,
-                        'Punch_In_Time': row['Punch_In_Time'] if pd.notna(row['Punch_In_Time']) else None,
-                        'Punch_Out_Time': row['Punch_Out_Time'] if pd.notna(row['Punch_Out_Time']) else None,
-                        'Shift_Out': row['Shift_Out'] if pd.notna(row['Shift_Out']) else None,
-                        'Hours_Worked': row['Hours_Worked'],
-                        'Status': row['Status'],
-                        'Late_By': row['Late_By'] if pd.notna(row['Late_By']) else None,
-                        'file_hash': file_hash
-                    }
-                    conn.execute(text(insert_query), values)
-                else:
-                    self.log_event("Warning", f"Skipped row due to invalid Employee ID: {row.to_json()}", file_name)
-            conn.commit()
+                try:
+                    if pd.notna(row['Employee_ID']) and len(str(row['Employee_ID']).strip()) == 8:
+                        employee_id = str(row['Employee_ID']).strip()
+                        punch_date = row['Punch_Date']
+                        
+                        # Check for existing record
+                        if self.check_duplicate_record(punch_date, employee_id):
+                            reason = f"Duplicate record found for date {punch_date} and employee {employee_id}"
+                            self.log_duplicate_record(row, file_name, reason)
+                            continue
+                        
+                        try:
+                            values = {
+                                'Punch_Date': punch_date,
+                                'Employee_ID': employee_id,
+                                'Employee_Name': row['Employee_Name'],
+                                'Shift_In': row['Shift_In'] if pd.notna(row['Shift_In']) else None,
+                                'Punch_In_Time': row['Punch_In_Time'] if pd.notna(row['Punch_In_Time']) else None,
+                                'Punch_Out_Time': row['Punch_Out_Time'] if pd.notna(row['Punch_Out_Time']) else None,
+                                'Shift_Out': row['Shift_Out'] if pd.notna(row['Shift_Out']) else None,
+                                'Hours_Worked': row['Hours_Worked'],
+                                'Status': row['Status'],
+                                'Late_By': row['Late_By'] if pd.notna(row['Late_By']) else None,
+                                'file_hash': file_hash
+                            }
+                            conn.execute(text(insert_query), values)
+                            successful_inserts += 1
+                            conn.commit()  # Commit after each successful insert
+                            
+                        except Exception as e:
+                            error_msg = f"Error inserting record for Employee {employee_id}: {str(e)[:200]}"  # Truncate error message
+                            self.log_event("Error", error_msg, file_name)
+                            self.log_duplicate_record(row, file_name, error_msg)
+                            continue  # Continue with next record
+                            
+                    else:
+                        reason = f"Invalid Employee ID format: {str(row['Employee_ID'])}"
+                        self.log_duplicate_record(row, file_name, reason)
+                        self.log_event("Warning", reason, file_name)
+                        
+                except Exception as e:
+                    error_msg = f"Error processing row: {str(e)[:200]}"  # Truncate error message
+                    self.log_event("Error", error_msg, file_name)
+                    continue  # Continue with next record
+            
+            # Log final summary
+            summary_msg = f"Processed {total_records} records. Successfully inserted {successful_inserts} records. Find {total_records - successful_inserts} duplicated records."
+            self.log_event("Summary", summary_msg, file_name)
+            print(summary_msg)
 
 class ExcelHandler(FileSystemEventHandler):
     def __init__(self, db_manager):
@@ -138,38 +206,14 @@ class ExcelHandler(FileSystemEventHandler):
             buf = f.read()
             hasher.update(buf)
         return hasher.hexdigest()
-    
-    def validate_employee_id(self, employee_id):
-        cleaned_id = str(employee_id).strip()
-        return len(cleaned_id) == 8 and ' ' not in cleaned_id
-
-    def check_missing_columns(self, df):
-        for column in df.columns:
-            if df[column].isna().all():
-                return True
-        return False
 
     def process_excel_file(self, file_path):
         file_hash = self.calculate_file_hash(file_path)
         file_name = os.path.basename(file_path)
         
-        if self.db_manager.check_file_processed(file_hash):
-            print(f"File {file_name} was already processed. Skipping...")
-            self.db_manager.log_event("Skipped", "File already processed", file_name)
-            return
-        
-        print(f"Processing file: {file_name}")
-        self.db_manager.log_event("Processing", "Started processing file", file_name)
-        
         try:
-            df = pd.read_excel(file_path, header=0)
+            df = pd.read_excel(file_path, header=1)
             df['Punch_Date'] = pd.to_datetime(df['Punch_Date']).dt.date
-
-            # # Check for missing columns
-            # if self.check_missing_columns(df):
-            #     self.db_manager.log_event("Error", "One or more columns have no data. Process aborted.", file_name)
-            #     print(f"File {file_name} has missing columns. Logged as error.")
-            #     return
 
             # Modified time column handling
             time_columns = ['Shift_In', 'Shift_Out']
@@ -177,7 +221,7 @@ class ExcelHandler(FileSystemEventHandler):
                 df[col] = pd.to_datetime(df[col], format='%H:%M', errors='coerce').dt.time
                 df[col] = df[col].apply(lambda x: x.strftime('%H:%M:%S') if x is not None else None)
             
-            # Other time columns remain unchanged
+            # Other time columns
             other_time_columns = ['Punch_In_Time', 'Punch_Out_Time', 'Late_By']
             for col in other_time_columns:
                 df[col] = pd.to_datetime(df[col], format='%H:%M:%S', errors='coerce')
