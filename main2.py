@@ -24,11 +24,13 @@ def open_folder():
 
 class DatabaseManager:
     def __init__(self, db_connection_string):
-        self.db_engine = create_engine(db_connection_string, connect_args={'sslmode': 'require'})
+        self.db_engine = create_engine(db_connection_string, connect_args={'sslmode': 'require','options': '-c timezone=Asia/Kolkata'})
         self.create_tables()
     
     def create_tables(self):
         create_table_query = """
+        -- Set timezone for the database session
+        SET timezone='Asia/Kolkata';
         CREATE TABLE IF NOT EXISTS biometric_attendance (
             id SERIAL PRIMARY KEY,
             Punch_Date DATE,
@@ -46,11 +48,11 @@ class DatabaseManager:
         );
         
         CREATE TABLE IF NOT EXISTS logs (
-            id SERIAL PRIMARY KEY,
-            event_type VARCHAR(50),
-            event_description TEXT,
-            file_name VARCHAR(255),
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        id SERIAL PRIMARY KEY,
+        event_type VARCHAR(50),
+        event_description TEXT,
+        file_name VARCHAR(255),
+        timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
         """
         with self.db_engine.connect() as conn:
@@ -61,7 +63,7 @@ class DatabaseManager:
     def log_event(self, event_type, event_description, file_name):
         log_query = """
         INSERT INTO logs (event_type, event_description, file_name, timestamp) 
-        VALUES (:event_type, :event_description, :file_name, :timestamp);
+        VALUES (:event_type, :event_description, :file_name, :timestamp AT TIME ZONE 'Asia/Kolkata');
         """
         with self.db_engine.connect() as conn:
             conn.execute(text(log_query), {
@@ -71,11 +73,27 @@ class DatabaseManager:
                 'timestamp': datetime.now(IST)
             })
             conn.commit()
-    
+        
     def check_file_processed(self, file_hash):
         query = "SELECT EXISTS(SELECT 1 FROM biometric_attendance WHERE file_hash = :file_hash);"
         with self.db_engine.connect() as conn:
             return conn.execute(text(query), {'file_hash': file_hash}).scalar()
+    
+    def convert_time_to_hours(self, time_str):
+        if pd.isna(time_str) or time_str is None:
+            return None
+        try:
+            if isinstance(time_str, str):
+                hours, minutes, seconds = map(int, time_str.split(':'))
+            elif isinstance(time_str, (datetime.time, pd.Timestamp)):
+                hours = time_str.hour
+                minutes = time_str.minute
+                seconds = time_str.second
+            else:
+                return None
+            return round(hours + minutes / 60 + seconds / 3600, 2)
+        except (ValueError, AttributeError):
+            return None
     
     def insert_attendance_data(self, df, file_hash):
         insert_query = """
@@ -84,31 +102,24 @@ class DatabaseManager:
             Punch_In_Time, Punch_Out_Time, Shift_Out, Hours_Worked, 
             Status, Late_By, file_hash
         ) VALUES (
-            :Punch_Date, :Employee_ID, :Employee_Name, :Shift_In, 
-            :Punch_In_Time, :Punch_Out_Time, :Shift_Out, :Hours_Worked, 
-            :Status, :Late_By, :file_hash
+            :Punch_Date, :Employee_ID, :Employee_Name, :Shift_In, :Punch_In_Time, :Punch_Out_Time, 
+            :Shift_Out, :Hours_Worked, :Status, :Late_By, :file_hash
         );
         """
         with self.db_engine.connect() as conn:
             for _, row in df.iterrows():
-                # Convert time objects to strings for database insertion
-                shift_in = str(row['Shift_In']) if pd.notna(row['Shift_In']) else None
-                shift_out = str(row['Shift_Out']) if pd.notna(row['Shift_Out']) else None
-                punch_in = str(row['Punch_In_Time']) if pd.notna(row['Punch_In_Time']) else None
-                punch_out = str(row['Punch_Out_Time']) if pd.notna(row['Punch_Out_Time']) else None
-                late_by = str(row['Late_By']) if pd.notna(row['Late_By']) else None
-
+                hours_worked = self.convert_time_to_hours(row['Hours_Worked'])
                 values = {
                     'Punch_Date': row['Punch_Date'],
                     'Employee_ID': row['Employee_ID'],
                     'Employee_Name': row['Employee_Name'],
-                    'Shift_In': shift_in,
-                    'Punch_In_Time': punch_in,
-                    'Punch_Out_Time': punch_out,
-                    'Shift_Out': shift_out,
+                    'Shift_In': row['Shift_In'] if pd.notna(row['Shift_In']) else None,
+                    'Punch_In_Time': row['Punch_In_Time'] if pd.notna(row['Punch_In_Time']) else None,
+                    'Punch_Out_Time': row['Punch_Out_Time'] if pd.notna(row['Punch_Out_Time']) else None,
+                    'Shift_Out': row['Shift_Out'] if pd.notna(row['Shift_Out']) else None,
                     'Hours_Worked': row['Hours_Worked'],
                     'Status': row['Status'],
-                    'Late_By': late_by,
+                    'Late_By': row['Late_By'] if pd.notna(row['Late_By']) else None,
                     'file_hash': file_hash
                 }
                 conn.execute(text(insert_query), values)
@@ -125,6 +136,21 @@ class ExcelHandler(FileSystemEventHandler):
             hasher.update(buf)
         return hasher.hexdigest()
     
+    def validate_employee_id(self, employee_id):
+        # Trim any leading/trailing whitespaces and check length
+        cleaned_id = str(employee_id).strip()
+        if len(cleaned_id) == 8 and ' ' not in cleaned_id:
+            return cleaned_id
+        else:
+            return None
+
+    def check_missing_columns(self, df):
+        # Check if any column is entirely missing data
+        for column in df.columns:
+            if df[column].isna().all():
+                return True
+        return False
+
     def process_excel_file(self, file_path):
         try:
             file_hash = self.calculate_file_hash(file_path)
@@ -141,11 +167,26 @@ class ExcelHandler(FileSystemEventHandler):
             df = pd.read_excel(file_path, header=1)
             df['Punch_Date'] = pd.to_datetime(df['Punch_Date']).dt.date
             
+            # Validate employee ID
+            df['Employee_ID'] = df['Employee_ID'].apply(self.validate_employee_id)
+            if df['Employee_ID'].isna().any():
+                raise ValueError("Invalid Employee ID format detected. IDs must be 8 characters with no spaces.")
+
+            # Check for missing columns
+            if self.check_missing_columns(df):
+                raise ValueError("One or more columns have no data. Process aborted.")
+            
             # Modified time column handling
-            time_columns = ['Shift_In', 'Punch_In_Time', 'Punch_Out_Time', 'Shift_Out', 'Late_By']
+            time_columns = ['Shift_In', 'Shift_Out']
             for col in time_columns:
-                # Convert to string first to handle any potential NaT values
-                df[col] = pd.to_datetime(df[col].astype(str), format='%H:%M:%S', errors='coerce').dt.time
+                df[col] = pd.to_datetime(df[col], format='%H:%M', errors='coerce').dt.time
+                df[col] = df[col].apply(lambda x: x.strftime('%H:%M:%S') if x is not None else None)
+            
+            # Other time columns remain unchanged
+            other_time_columns = ['Punch_In_Time', 'Punch_Out_Time', 'Late_By']
+            for col in other_time_columns:
+                df[col] = pd.to_datetime(df[col], format='%H:%M:%S', errors='coerce')
+                df[col] = df[col].apply(lambda x: x.strftime('%H:%M:%S') if pd.notna(x) else None)
             
             self.db_manager.insert_attendance_data(df, file_hash)
             self.db_manager.log_event("Success", "File processed successfully", file_name)
@@ -180,4 +221,4 @@ def main():
     observer.join()
 
 if __name__ == "__main__":
-    main()
+    main()   # Run the main function
