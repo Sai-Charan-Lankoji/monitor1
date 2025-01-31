@@ -10,6 +10,7 @@ import hashlib
 from winotify import Notification, audio  
 import traceback
 import subprocess
+import hupper  # Import hupper for hot-reloading
 
 # Initialize notification settings
 app_name = "Attendance Monitor"
@@ -149,25 +150,27 @@ class ExcelHandler(FileSystemEventHandler):
         return False
 
     def process_excel_file(self, file_path):
+        file_hash = self.calculate_file_hash(file_path)
+        file_name = os.path.basename(file_path)
+        
+        if self.db_manager.check_file_processed(file_hash):
+            print(f"File {file_name} was already processed. Skipping...")
+            self.db_manager.log_event("Skipped", "File already processed", file_name)
+            return
+        
+        print(f"Processing file: {file_name}")
+        self.db_manager.log_event("Processing", "Started processing file", file_name)
+        
         try:
-            file_hash = self.calculate_file_hash(file_path)
-            file_name = os.path.basename(file_path)
-            
-            if self.db_manager.check_file_processed(file_hash):
-                print(f"File {file_name} was already processed. Skipping...")
-                self.db_manager.log_event("Skipped", "File already processed", file_name)
-                return
-            
-            print(f"Processing file: {file_name}")
-            self.db_manager.log_event("Processing", "Started processing file", file_name)
-            
             df = pd.read_excel(file_path, header=0)
             df['Punch_Date'] = pd.to_datetime(df['Punch_Date']).dt.date
 
             # # Check for missing columns
             # if self.check_missing_columns(df):
-            #     raise ValueError("One or more columns have no data. Process aborted.")
-            
+            #     self.db_manager.log_event("Error", "One or more columns have no data. Process aborted.", file_name)
+            #     print(f"File {file_name} has missing columns. Logged as error.")
+            #     return
+
             # Modified time column handling
             time_columns = ['Shift_In', 'Shift_Out']
             for col in time_columns:
@@ -187,7 +190,7 @@ class ExcelHandler(FileSystemEventHandler):
         except Exception as e:
             error_message = str(e)
             self.db_manager.log_event("Error", error_message, file_name)
-            traceback.print_exc()
+            print(f"An error occurred while processing {file_name}: {error_message}")
 
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith('.xlsx'):
