@@ -9,7 +9,6 @@ import hashlib
 from winotify import Notification, audio  
 import traceback
 import subprocess
-import pyodbc
 
 # Initialize notification settings
 app_name = "Attendance Monitor"
