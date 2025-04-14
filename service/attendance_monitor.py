@@ -1,4 +1,3 @@
-# attendance_monitor.py
 import sys
 import os
 import time
@@ -20,11 +19,9 @@ import configparser
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
-    except Exception:
+    except AttributeError:
         base_path = os.path.abspath(".")
-
     return os.path.join(base_path, relative_path)
 
 class FolderMonitorThread(QThread):
@@ -38,18 +35,21 @@ class FolderMonitorThread(QThread):
         self.running = True
         
     def run(self):
-        event_handler = ExcelHandler(self.db_manager, self.log_signal, self.icon_path)
-        observer = Observer()
-        observer.schedule(event_handler, self.folder_path, recursive=False)
-        observer.start()
-        
-        self.log_signal.emit(f"Started monitoring folder: {self.folder_path}")
-        
-        while self.running:
-            time.sleep(1)
+        try:
+            event_handler = ExcelHandler(self.db_manager, self.log_signal, self.icon_path)
+            observer = Observer()
+            observer.schedule(event_handler, self.folder_path, recursive=False)
+            observer.start()
+            self.log_signal.emit(f"Started monitoring folder: {self.folder_path}")
             
-        observer.stop()
-        observer.join()
+            while self.running:
+                time.sleep(1)
+                
+        except Exception as e:
+            self.log_signal.emit(f"Monitoring error: {str(e)}")
+        finally:
+            observer.stop()
+            observer.join()
     
     def stop(self):
         self.running = False
@@ -127,17 +127,21 @@ class DatabaseManager:
         cursor.close()
 
     def log_event(self, event_type, event_description, file_name):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "INSERT INTO logs (event_type, event_description, file_name, timestamp) VALUES (?, ?, ?, GETDATE())",
-            (event_type, event_description, file_name)
-        )
-        self.conn.commit()
-        cursor.close()
-    
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO logs (event_type, event_description, file_name, timestamp) VALUES (?, ?, ?, GETDATE())",
+                (event_type, event_description[:500], file_name)
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            print(f"Failed to log event: {str(e)}")
+
     def insert_attendance_data(self, df, file_hash, file_name):
         cursor = self.conn.cursor()
         successful_inserts = 0
+        successful_updates = 0
         total_records = len(df)
         
         for _, row in df.iterrows():
@@ -147,8 +151,39 @@ class DatabaseManager:
                 
                 cursor.execute("SELECT COUNT(*) FROM biometric_attendance WHERE Punch_Date=? AND Employee_ID=?", (punch_date, employee_id))
                 if cursor.fetchone()[0] > 0:
-                    reason = f"Duplicate record found for date {punch_date} and employee {employee_id}"
-                    cursor.execute("INSERT INTO duplicate_records_log (Punch_Date, Employee_ID, Employee_Name, file_name, reason, logged_at) VALUES (?, ?, ?, ?, ?, GETDATE())", (punch_date, employee_id, row['Employee_Name'], file_name, reason))
+                    reason = f"Record updated with new data for date {punch_date} and employee {employee_id}"
+                    cursor.execute(
+                        "INSERT INTO duplicate_records_log (Punch_Date, Employee_ID, Employee_Name, file_name, reason, logged_at) VALUES (?, ?, ?, ?, ?, GETDATE())",
+                        (punch_date, employee_id, row['Employee_Name'], file_name, reason)
+                    )
+                    cursor.execute("""
+                        UPDATE biometric_attendance
+                        SET Employee_Name = ?,
+                            Shift_In = ?,
+                            Punch_In_Time = ?,
+                            Punch_Out_Time = ?,
+                            Shift_Out = ?,
+                            Hours_Worked = ?,
+                            Status = ?,
+                            Late_By = ?,
+                            file_hash = ?,
+                            processed_at = GETDATE()
+                        WHERE Punch_Date = ? AND Employee_ID = ?
+                    """, (
+                        row['Employee_Name'],
+                        row['Shift_In'] if pd.notna(row['Shift_In']) else None,
+                        row['Punch_In_Time'] if pd.notna(row['Punch_In_Time']) else None,
+                        row['Punch_Out_Time'] if pd.notna(row['Punch_Out_Time']) else None,
+                        row['Shift_Out'] if pd.notna(row['Shift_Out']) else None,
+                        row['Hours_Worked'],
+                        row['Status'],
+                        row['Late_By'] if pd.notna(row['Late_By']) else None,
+                        file_hash,
+                        punch_date,
+                        employee_id
+                    ))
+                    successful_updates += 1
+                    self.conn.commit()
                     continue
                 
                 cursor.execute("""
@@ -172,7 +207,7 @@ class DatabaseManager:
             except Exception as e:
                 self.log_event("Error", str(e)[:200], file_name)
         
-        summary_msg = f"Processed {total_records} records. Successfully inserted {successful_inserts} records."
+        summary_msg = f"Processed {total_records} records. Inserted {successful_inserts} records. Updated {successful_updates} records."
         self.log_event("Summary", summary_msg, file_name)
         return summary_msg
 
@@ -198,7 +233,8 @@ class ExcelHandler(FileSystemEventHandler):
                 duration="short"
             ).show()
         except Exception as e:
-            self.log_signal.emit(f"Error processing file {file_path}: {str(e)}")
+            error_msg = f"Error processing file {file_path}: {str(e)}"
+            self.log_signal.emit(error_msg)
             Notification(
                 app_id="Attendance Monitor",
                 title="Error Processing File",
@@ -223,7 +259,6 @@ class AttendanceMonitorApp(QMainWindow):
         self.initUI()
         self.setup_tray()
         self.load_settings()
-        self.auto_connect()
         
     def initUI(self):
         self.setWindowTitle('Attendance Monitor')
@@ -315,11 +350,8 @@ class AttendanceMonitorApp(QMainWindow):
             self.folder_path_label.setText(folder_path)
         
     def save_settings(self):
-        self.settings.setValue("host", self.connection_fields['host'].text())
-        self.settings.setValue("port", self.connection_fields['port'].text())
-        self.settings.setValue("database", self.connection_fields['database'].text())
-        self.settings.setValue("username", self.connection_fields['username'].text())
-        self.settings.setValue("password", self.connection_fields['password'].text())
+        for field in ['host', 'port', 'database', 'username', 'password']:
+            self.settings.setValue(field, self.connection_fields[field].text())
         self.settings.setValue("folder_path", self.folder_path_label.text())
         
     def log_message(self, message):
@@ -327,17 +359,27 @@ class AttendanceMonitorApp(QMainWindow):
         self.log_display.append(f"[{current_time}] {message}")
     
     def connect_to_database(self, silent=False):
-        connection_params = {field: widget.text() for field, widget in self.connection_fields.items()}
+        connection_params = {field: widget.text().strip() for field, widget in self.connection_fields.items()}
+        
+        # Validate input fields
+        missing_fields = [field.capitalize() for field, value in connection_params.items() if not value]
+        if missing_fields:
+            error_msg = f"Please fill in: {', '.join(missing_fields)}"
+            self.log_message(error_msg)
+            if not silent:
+                QMessageBox.critical(self, 'Error', error_msg)
+            return
+        
         self.db_manager = DatabaseManager(connection_params, self.icon_path)
         success, message = self.db_manager.connect()
         
         if success:
             self.log_message(message)
             self.start_btn.setEnabled(True)
+            self.connect_btn.setEnabled(False)
+            self.save_settings()
             if not silent:
                 QMessageBox.information(self, 'Success', 'Database connected')
-            if self.folder_path_label.text():
-                self.start_monitoring()
         else:
             self.log_message(f"Connection failed: {message}")
             if not silent:
@@ -347,17 +389,25 @@ class AttendanceMonitorApp(QMainWindow):
         folder_path = QFileDialog.getExistingDirectory(self, 'Select Folder')
         if folder_path:
             self.folder_path_label.setText(folder_path)
+            self.save_settings()
             if self.db_manager and self.db_manager.conn:
                 self.start_btn.setEnabled(True)
     
     def start_monitoring(self):
         if not self.db_manager or not self.db_manager.conn:
             self.log_message("Not connected to database")
+            QMessageBox.warning(self, 'Warning', 'Connect to database first')
             return
             
         folder_path = self.folder_path_label.text()
-        if not folder_path:
+        if not folder_path or folder_path == 'No folder selected':
+            self.log_message("No folder selected")
             QMessageBox.warning(self, 'Warning', 'Select a folder first')
+            return
+        
+        if not os.path.isdir(folder_path):
+            self.log_message(f"Invalid folder: {folder_path} does not exist")
+            QMessageBox.critical(self, 'Error', f'Folder {folder_path} does not exist')
             return
         
         self.monitor_thread = FolderMonitorThread(folder_path, self.db_manager, self.icon_path)
@@ -368,7 +418,6 @@ class AttendanceMonitorApp(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.connect_btn.setEnabled(False)
         self.log_message("Monitoring started")
-        self.save_settings()
     
     def stop_monitoring(self):
         if self.monitor_thread:
@@ -376,7 +425,7 @@ class AttendanceMonitorApp(QMainWindow):
             self.monitor_thread.wait()
             self.monitor_thread = None
             
-        self.start_btn.setEnabled(True)
+        self.start_btn.setEnabled(self.db_manager and self.db_manager.conn)
         self.stop_btn.setEnabled(False)
         self.connect_btn.setEnabled(True)
         self.log_message("Monitoring stopped")
@@ -400,18 +449,20 @@ def create_default_icon():
     
     icon_path = resource_path("logo.png")
     if not os.path.exists(icon_path):
-        c = canvas.Canvas(icon_path, pagesize=(256, 256))
-        c.setFillColor(colors.blue)
-        c.rect(0, 0, 256, 256, fill=1)
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica", 40)
-        c.drawCentredString(128, 128, "AM")
-        c.save()
-        
-        # Convert PDF to PNG
-        img = Image.open(icon_path)
-        img.save(icon_path.replace('.pdf', '.png'))
-        os.remove(icon_path)
+        try:
+            c = canvas.Canvas("temp_logo.pdf", pagesize=(256, 256))
+            c.setFillColor(colors.blue)
+            c.rect(0, 0, 256, 256, fill=1)
+            c.setFillColor(colors.white)
+            c.setFont("Helvetica", 40)
+            c.drawCentredString(128, 128, "AM")
+            c.save()
+            
+            img = Image.open("temp_logo.pdf")
+            img.save(icon_path)
+            os.remove("temp_logo.pdf")
+        except Exception as e:
+            print(f"Failed to create default icon: {str(e)}")
 
 if __name__ == "__main__":
     create_default_icon()
