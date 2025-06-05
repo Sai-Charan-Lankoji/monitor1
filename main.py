@@ -10,7 +10,7 @@ import subprocess
 
 # Initialize notification settings
 app_name = "Attendance Monitor"
-icon_path = r"D:\monitor1\logo.png"  
+# icon_path = r"D:\monitor1\logo.png"  
 monitor_folder = r"D:\monitor1\data"
 
 # Indian Standard Time (IST) Offset

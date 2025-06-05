@@ -1,5 +1,9 @@
 pandas
 psycopg2
+PyQt6
+pyodbc
 sqlalchemy
 watchdog
+reportlab
 winotify    #pip install -r requirements.txt
+ 

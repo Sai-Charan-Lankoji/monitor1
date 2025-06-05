@@ -160,7 +160,7 @@ class ExcelHandler(FileSystemEventHandler):
     
     def process_excel_file(self, file_path):
         try:
-            df = pd.read_excel(file_path, header=0)
+            df = pd.read_excel(file_path, header=1)
             df['Punch_Date'] = pd.to_datetime(df['Punch_Date']).dt.date
             file_hash = hashlib.sha256(open(file_path, 'rb').read()).hexdigest()
             result = self.db_manager.insert_attendance_data(df, file_hash, os.path.basename(file_path))
@@ -317,6 +317,10 @@ class AttendanceMonitorApp(QMainWindow):
         if self.monitor_thread:
             self.stop_monitoring()
         event.accept()
+
+
+
+        
 
 def main():
     app = QApplication(sys.argv)
