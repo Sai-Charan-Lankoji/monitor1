@@ -3,16 +3,15 @@ import os
 import time
 import hashlib
 import pandas as pd
-import pyodbc
 from datetime import datetime, timedelta
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                           QHBoxLayout, QPushButton, QLabel, QTextEdit, 
-                           QFileDialog, QMessageBox, QLineEdit, QSystemTrayIcon, QMenu)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QStandardPaths, QTimer
-from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QStandardPaths, QTimer, QDate
+from PyQt6.QtGui import QIcon
 from notifications import NotificationManager
+from database_manager import DatabaseManager
+from ui_manager import AttendanceMonitorUI
 import configparser
 import psutil  # For process management
 import win32api  # For Windows-specific file operations
@@ -144,14 +143,13 @@ class FolderMonitorThread(QThread):
                                 else:
                                     failed_files.append(file_name)
                             
-
                             # Show summary notification after batch processing
                             if len(self.batch_files) > 0 or len(failed_files) > 0:
                                 self.notification_manager.batch_processing_completed(success_count, len(failed_files))
+                                status_msg = f"Successfully processed {success_count} files. Failed: {len(failed_files)} files."
                                 self.log_signal.emit(f"Completed batch processing. {status_msg}")
                                 if failed_files:
                                     self.log_signal.emit(f"Failed files: {', '.join(failed_files)}")
-
                         except Exception as e:
                             self.log_signal.emit(f"Error processing queued file: {str(e)}")
                         finally:
@@ -201,236 +199,6 @@ class FolderMonitorThread(QThread):
     
     def stop(self):
         self.running = False
-
-class DatabaseManager:
-    def __init__(self, connection_params, notification_manager):
-        self.connection_params = connection_params
-        self.notification_manager = notification_manager
-        self.conn = None
-        
-    def connect(self):
-        try:
-            # Add connection timeout
-            self.conn = pyodbc.connect(
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                f"SERVER={self.connection_params['host']},{self.connection_params['port']};"
-                f"DATABASE={self.connection_params['database']};"
-                f"UID={self.connection_params['username']};"
-                f"PWD={self.connection_params['password']};"
-                f"Connection Timeout=30;"
-                f"TrustServerCertificate=yes;"
-            )
-            
-            # Set better timeout for queries
-            self.conn.timeout = 60
-            self.create_tables()
-            
-            # Test connection with a simple query
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT @@version")
-            cursor.fetchone()
-            cursor.close()
-            
-            self.notification_manager.db_connected()
-            return True, "Successfully connected to database"
-        except Exception as e:
-            return False, f"Connection error: {str(e)}"
-
-    def create_tables(self):
-        create_table_query = """
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='biometric_attendance' AND xtype='U')
-        CREATE TABLE biometric_attendance (
-            id INT IDENTITY(1,1) PRIMARY KEY,
-            Punch_Date DATE,
-            Employee_ID VARCHAR(50),
-            Employee_Name VARCHAR(100),
-            Shift_In TIME,
-            Punch_In_Time TIME,
-            Punch_Out_Time TIME,
-            Shift_Out TIME,
-            Hours_Worked VARCHAR(8),
-            Status VARCHAR(50),
-            Late_By TIME,
-            file_hash VARCHAR(64),
-            processed_at DATETIME DEFAULT GETDATE(),
-            CONSTRAINT unique_employee_record UNIQUE (Punch_Date, Employee_ID)
-        );
-        
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='duplicate_records_log' AND xtype='U')
-        CREATE TABLE duplicate_records_log (
-            id INT IDENTITY(1,1) PRIMARY KEY,
-            Punch_Date DATE,
-            Employee_ID VARCHAR(50),
-            Employee_Name VARCHAR(100),
-            file_name VARCHAR(255),
-            logged_at DATETIME DEFAULT GETDATE(),
-            reason TEXT
-        );
-        
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='logs' AND xtype='U')
-        CREATE TABLE logs (
-            id INT IDENTITY(1,1) PRIMARY KEY,
-            event_type VARCHAR(50),
-            event_description TEXT,
-            file_name VARCHAR(255),
-            timestamp DATETIME DEFAULT GETDATE()
-        );
-        """
-        cursor = self.conn.cursor()
-        cursor.execute(create_table_query)
-        self.conn.commit()
-        cursor.close()
-
-    def log_event(self, event_type, event_description, file_name):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "INSERT INTO logs (event_type, event_description, file_name, timestamp) VALUES (?, ?, ?, GETDATE())",
-                (event_type, event_description[:500], file_name)
-            )
-            self.conn.commit()
-            cursor.close()
-        except Exception as e:
-            print(f"Failed to log event: {str(e)}")
-
-    def insert_attendance_data(self, df, file_hash, file_name):
-        cursor = self.conn.cursor()
-        successful_inserts = 0
-        successful_updates = 0
-        total_records = len(df)
-        
-        for _, row in df.iterrows():
-            try:
-                employee_id = str(row['Employee_ID']).strip()
-                punch_date = row['Punch_Date']
-                
-                # Check if record exists
-                cursor.execute("SELECT Punch_In_Time, Punch_Out_Time FROM biometric_attendance WHERE Punch_Date=? AND Employee_ID=?", (punch_date, employee_id))
-                existing_record = cursor.fetchone()
-                
-                if existing_record:
-                    # Get existing punch times
-                    existing_in_time = existing_record[0]  # Punch_In_Time
-                    existing_out_time = existing_record[1]  # Punch_Out_Time
-                    
-                    # Get new punch times
-                    new_in_time = row['Punch_In_Time'] if pd.notna(row['Punch_In_Time']) else None
-                    new_out_time = row['Punch_Out_Time'] if pd.notna(row['Punch_Out_Time']) else None
-                    
-                    # Logic: Keep earliest punch-in time and latest punch-out time
-                    final_in_time = self.get_earliest_time(existing_in_time, new_in_time)
-                    final_out_time = self.get_latest_time(existing_out_time, new_out_time)
-                    
-                    # Get hours worked from Excel file
-                    hours_worked_value = row['Hours_Worked'] if pd.notna(row['Hours_Worked']) else None
-                    
-                    # Only update if we have changes
-                    if (final_in_time != existing_in_time or final_out_time != existing_out_time):
-                        # Log the update
-                        reason = f"Record updated for date {punch_date} and employee {employee_id}. "
-                        if existing_in_time != final_in_time:
-                            reason += f"Punch-in updated from {existing_in_time} to {final_in_time}. "
-                        if existing_out_time != final_out_time:
-                            reason += f"Punch-out updated from {existing_out_time} to {final_out_time}."
-                        
-                        cursor.execute(
-                            "INSERT INTO duplicate_records_log (Punch_Date, Employee_ID, Employee_Name, file_name, reason, logged_at) VALUES (?, ?, ?, ?, ?, GETDATE())",
-                            (punch_date, employee_id, row['Employee_Name'], file_name, reason)
-                        )
-                        
-                        cursor.execute("""
-                            UPDATE biometric_attendance
-                            SET Employee_Name = ?,
-                                Shift_In = ?,
-                                Punch_In_Time = ?,
-                                Punch_Out_Time = ?,
-                                Shift_Out = ?,
-                                Hours_Worked = ?,
-                                Status = ?,
-                                Late_By = ?,
-                                file_hash = ?,
-                                processed_at = GETDATE()
-                            WHERE Punch_Date = ? AND Employee_ID = ?
-                        """, (
-                            row['Employee_Name'],
-                            row['Shift_In'] if pd.notna(row['Shift_In']) else None,
-                            final_in_time,
-                            final_out_time,
-                            row['Shift_Out'] if pd.notna(row['Shift_Out']) else None,
-                            hours_worked_value,  # Always use the Excel hours
-                            row['Status'],
-                            row['Late_By'] if pd.notna(row['Late_By']) else None,
-                            file_hash,
-                            punch_date,
-                            employee_id
-                        ))
-                        successful_updates += 1
-                        self.conn.commit()
-                        continue
-                    else:
-                        # Log that no changes were made
-                        cursor.execute(
-                            "INSERT INTO duplicate_records_log (Punch_Date, Employee_ID, Employee_Name, file_name, reason, logged_at) VALUES (?, ?, ?, ?, ?, GETDATE())",
-                            (punch_date, employee_id, row['Employee_Name'], file_name, "Record exists but no changes to punch times were needed")
-                        )
-                        self.conn.commit()
-                        continue
-                
-                # Insert new record
-                cursor.execute("""
-                    INSERT INTO biometric_attendance (Punch_Date, Employee_ID, Employee_Name, Shift_In, Punch_In_Time, Punch_Out_Time, Shift_Out, Hours_Worked, Status, Late_By, file_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    punch_date,
-                    employee_id,
-                    row['Employee_Name'],
-                    row['Shift_In'] if pd.notna(row['Shift_In']) else None,
-                    row['Punch_In_Time'] if pd.notna(row['Punch_In_Time']) else None,
-                    row['Punch_Out_Time'] if pd.notna(row['Punch_Out_Time']) else None,
-                    row['Shift_Out'] if pd.notna(row['Shift_Out']) else None,
-                    row['Hours_Worked'] if pd.notna(row['Hours_Worked']) else None,
-                    row['Status'],
-                    row['Late_By'] if pd.notna(row['Late_By']) else None,
-                    file_hash
-                ))
-                successful_inserts += 1
-                self.conn.commit()
-            except Exception as e:
-                self.log_event("Error", str(e)[:200], file_name)
-        
-        summary_msg = f"Processed {total_records} records. Inserted {successful_inserts} records. Updated {successful_updates} records."
-        self.log_event("Summary", summary_msg, file_name)
-        return summary_msg
-    
-    def get_earliest_time(self, time1, time2):
-        """Returns the earlier of two time values, or the non-None value if one is None"""
-        if time1 is None:
-            return time2
-        if time2 is None:
-            return time1
-            
-        # Convert strings to datetime.time objects if needed
-        if isinstance(time1, str):
-            time1 = datetime.strptime(time1, '%H:%M:%S').time()
-        if isinstance(time2, str):
-            time2 = datetime.strptime(time2, '%H:%M:%S').time()
-            
-        return time1 if time1 < time2 else time2
-        
-    def get_latest_time(self, time1, time2):
-        """Returns the later of two time values, or the non-None value if one is None"""
-        if time1 is None:
-            return time2
-        if time2 is None:
-            return time1
-            
-        # Convert strings to datetime.time objects if needed
-        if isinstance(time1, str):
-            time1 = datetime.strptime(time1, '%H:%M:%S').time()
-        if isinstance(time2, str):
-            time2 = datetime.strptime(time2, '%H:%M:%S').time()
-            
-        return time1 if time1 > time2 else time2
 
 class ExcelHandler(FileSystemEventHandler):
     def __init__(self, db_manager, log_signal, notification_manager, monitor_thread=None):
@@ -565,17 +333,12 @@ class ExcelHandler(FileSystemEventHandler):
                 # Queue the file for processing if it was modified
                 self.monitor_thread.queue_file(event.src_path)
 
-class AttendanceMonitorApp(QMainWindow):
+class AttendanceMonitorApp:
     def __init__(self):
-        super().__init__()
         self.monitor_thread = None
         self.db_manager = None
         self.icon_path = resource_path("logo.png")
-        self.setWindowIcon(QIcon(self.icon_path))
         self.settings = QSettings("YourCompany", "AttendanceMonitor")
-        
-        # Initialize notification manager
-        self.notification_manager = NotificationManager(icon_path=self.icon_path)
         
         # Load version info
         self.version = "1.0.0"  # Default version
@@ -586,97 +349,57 @@ class AttendanceMonitorApp(QMainWindow):
                     self.version = f.read().strip()
         except:
             pass
-    
-        self.initUI()
-        self.setup_tray()
-        self.load_settings()
         
-        # Show version in window title
-        self.setWindowTitle(f'Attendance Monitor v{self.version}')
+        # Initialize notification manager
+        self.notification_manager = NotificationManager(icon_path=self.icon_path)
+        
+        # Initialize UI manager
+        self.ui = AttendanceMonitorUI(self, self.icon_path, self.version)
+        
+        # Connect UI signals
+        self.connect_signals()
+        
+        # Load settings
+        self.load_settings()
         
         # Auto-connect and start monitoring with a slight delay to allow UI to initialize
         QTimer.singleShot(500, self.auto_connect)
         
         # Setup system resource monitoring
-        self.resource_timer = QTimer(self)
+        self.resource_timer = QTimer()
         self.resource_timer.timeout.connect(self.check_system_resources)
         self.resource_timer.start(60000)  # Check every minute
     
-    def initUI(self):
-        self.setWindowTitle('Attendance Monitor')
-        self.setMinimumSize(800, 600)
+    def connect_signals(self):
+        """Connect signals to slots"""
+        # Connect the database button
+        self.ui.connect_btn.clicked.connect(lambda: self.connect_to_database(silent=False))
         
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
+        # Connect folder selection button
+        self.ui.select_folder_btn.clicked.connect(self.select_folder)
         
-        # Database connection section
-        db_group = QWidget()
-        db_layout = QVBoxLayout(db_group)
+        # Connect monitoring buttons
+        self.ui.start_btn.clicked.connect(self.start_monitoring)
+        self.ui.stop_btn.clicked.connect(self.stop_monitoring)
         
-        fields_layout = QVBoxLayout()
-        self.connection_fields = {}
-        for field in ['host', 'port', 'database', 'username', 'password']:
-            field_layout = QHBoxLayout()
-            label = QLabel(f"{field.capitalize()}:")
-            label.setMinimumWidth(100)
-            input_field = QLineEdit()
-            if field == 'password':
-                input_field.setEchoMode(QLineEdit.EchoMode.Password)
-            self.connection_fields[field] = input_field
-            field_layout.addWidget(label)
-            field_layout.addWidget(input_field)
-            fields_layout.addLayout(field_layout)
+        # Connect filter type change
+        self.ui.filter_type.currentIndexChanged.connect(self.change_filter_type)
         
-        db_layout.addLayout(fields_layout)
-        self.connect_btn = QPushButton('Connect to Database')
-        self.connect_btn.clicked.connect(lambda: self.connect_to_database(silent=False))
-        db_layout.addWidget(self.connect_btn)
-        layout.addWidget(db_group)
+        # Connect query and export buttons
+        self.ui.run_query_btn.clicked.connect(self.query_database)
+        self.ui.export_btn.clicked.connect(self.export_results)
         
-        # Folder selection
-        folder_group = QWidget()
-        folder_layout = QHBoxLayout(folder_group)
-        self.folder_path_label = QLabel('No folder selected')
-        folder_layout.addWidget(self.folder_path_label)
-        self.select_folder_btn = QPushButton('Select Folder')  # Add 'self.' to reference it elsewhere
-        self.select_folder_btn.clicked.connect(self.select_folder)
-        folder_layout.addWidget(self.select_folder_btn)
-        layout.addWidget(folder_group)
-        
-        # Monitoring controls
-        button_group = QWidget()
-        button_layout = QHBoxLayout(button_group)
-        self.start_btn = QPushButton('Start Monitoring')
-        self.start_btn.clicked.connect(self.start_monitoring)
-        self.start_btn.setEnabled(False)
-        button_layout.addWidget(self.start_btn)
-        self.stop_btn = QPushButton('Stop Monitoring')
-        self.stop_btn.clicked.connect(self.stop_monitoring)
-        self.stop_btn.setEnabled(False)
-        button_layout.addWidget(self.stop_btn)
-        layout.addWidget(button_group)
-        
-        # Log display
-        self.log_display = QTextEdit()
-        self.log_display.setReadOnly(True)
-        layout.addWidget(self.log_display)
-        
-    def setup_tray(self):
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon(self.icon_path))
-        
-        tray_menu = QMenu()
-        show_action = QAction("Show", self)
-        quit_action = QAction("Quit", self)
-        show_action.triggered.connect(self.show)
-        quit_action.triggered.connect(self.quit_app)
-        tray_menu.addAction(show_action)
-        tray_menu.addAction(quit_action)
-        
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.show()
-        
+        # Connect tray icon actions - FIXED: Use window.show() instead of show()
+        actions = self.ui.tray_icon.contextMenu().actions()
+        for action in actions:
+            if action.text() == "Show Window":
+                action.triggered.connect(self.ui.window.show)  # Changed from self.ui.show
+            elif action.text() == "Exit Application":
+                action.triggered.connect(self.quit_app)
+
+        # Connect window close event
+        self.ui.window.closeEvent = self.closeEvent
+    
     def auto_connect(self):
         # Check if we have saved credentials and folder path
         has_credentials = all(self.settings.value(field) for field in ['host', 'port', 'database', 'username', 'password'])
@@ -695,27 +418,25 @@ class AttendanceMonitorApp(QMainWindow):
                 QTimer.singleShot(1000, self.start_monitoring)
     
     def load_settings(self):
-        self.connection_fields['host'].setText(self.settings.value("host", ""))
-        self.connection_fields['port'].setText(self.settings.value("port", "1433"))
-        self.connection_fields['database'].setText(self.settings.value("database", ""))
-        self.connection_fields['username'].setText(self.settings.value("username", ""))
-        self.connection_fields['password'].setText(self.settings.value("password", ""))
+        self.ui.connection_fields['host'].setText(self.settings.value("host", ""))
+        self.ui.connection_fields['port'].setText(self.settings.value("port", "1433"))
+        self.ui.connection_fields['database'].setText(self.settings.value("database", ""))
+        self.ui.connection_fields['username'].setText(self.settings.value("username", ""))
+        self.ui.connection_fields['password'].setText(self.settings.value("password", ""))
         folder_path = self.settings.value("folder_path", "")
         if folder_path:
-            self.folder_path_label.setText(folder_path)
+            self.ui.folder_path_label.setText(folder_path)
         
     def save_settings(self):
         for field in ['host', 'port', 'database', 'username', 'password']:
-            self.settings.setValue(field, self.connection_fields[field].text())
-        self.settings.setValue("folder_path", self.folder_path_label.text())
+            self.settings.setValue(field, self.ui.connection_fields[field].text())
+        self.settings.setValue("folder_path", self.ui.folder_path_label.text())
         
     def log_message(self, message):
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        self.log_display.append(f"[{current_time}] {message}")
+        self.ui.log_message(message)
     
-    # Update connect_to_database method
     def connect_to_database(self, silent=False, retry_count=0, max_retries=3):
-        connection_params = {field: widget.text().strip() for field, widget in self.connection_fields.items()}
+        connection_params = {field: widget.text().strip() for field, widget in self.ui.connection_fields.items()}
         
         # Validate input fields
         missing_fields = [field.capitalize() for field, value in connection_params.items() if not value]
@@ -723,7 +444,7 @@ class AttendanceMonitorApp(QMainWindow):
             error_msg = f"Please fill in: {', '.join(missing_fields)}"
             self.log_message(error_msg)
             if not silent:
-                QMessageBox.critical(self, 'Error', error_msg)
+                self.ui.show_error_dialog('Error', error_msg)
             return
         
         self.db_manager = DatabaseManager(connection_params, self.notification_manager)
@@ -731,11 +452,17 @@ class AttendanceMonitorApp(QMainWindow):
         
         if success:
             self.log_message(message)
-            self.start_btn.setEnabled(True)
-            self.connect_btn.setEnabled(False)
+            self.ui.start_btn.setEnabled(True)
+            self.ui.connect_btn.setEnabled(False)
+            self.ui.run_query_btn.setEnabled(True)  # Enable database query button
             self.save_settings()
+            
+            # Load employee suggestions if we're on the employee filter
+            if self.ui.filter_type.currentIndex() == 1:
+                self.load_employee_suggestions()
+            
             if not silent:
-                QMessageBox.information(self, 'Success', 'Database connected')
+                self.ui.show_message_box('Success', 'Database connected')
         else:
             if retry_count < max_retries:
                 retry_count += 1
@@ -746,48 +473,49 @@ class AttendanceMonitorApp(QMainWindow):
                 # Always show notification for connection failure
                 self.notification_manager.db_connection_failed(message, max_retries)
                 if not silent:
-                    QMessageBox.critical(self, 'Error', f'Connection failed after {max_retries} attempts:\n{message}')
+                    self.ui.show_error_dialog('Error', f'Connection failed after {max_retries} attempts:\n{message}')
     
     def select_folder(self):
-        folder_path = QFileDialog.getExistingDirectory(self, 'Select Folder')
+        folder_path = self.ui.get_folder_dialog()
         if folder_path:
-            self.folder_path_label.setText(folder_path)
+            self.ui.folder_path_label.setText(folder_path)
             self.save_settings()
             if self.db_manager and self.db_manager.conn:
-                self.start_btn.setEnabled(True)
+                self.ui.start_btn.setEnabled(True)
     
-    # Update start_monitoring method
     def start_monitoring(self):
         if not self.db_manager or not self.db_manager.conn:
             self.log_message("Not connected to database")
-            QMessageBox.warning(self, 'Warning', 'Connect to database first')
+            self.ui.show_warning_dialog('Warning', 'Connect to database first')
             return
             
-        folder_path = self.folder_path_label.text()
+        folder_path = self.ui.folder_path_label.text()
         if not folder_path or folder_path == 'No folder selected':
             self.log_message("No folder selected")
-            QMessageBox.warning(self, 'Warning', 'Select a folder first')
+            self.ui.show_warning_dialog('Warning', 'Select a folder first')
             return
         
         if not os.path.isdir(folder_path):
             self.log_message(f"Invalid folder: {folder_path} does not exist")
-            QMessageBox.critical(self, 'Error', f'Folder {folder_path} does not exist')
+            self.ui.show_error_dialog('Error', f'Folder {folder_path} does not exist')
             return
         
         self.monitor_thread = FolderMonitorThread(folder_path, self.db_manager, self.notification_manager)
         self.monitor_thread.log_signal.connect(self.log_message)
         self.monitor_thread.start()
         
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.connect_btn.setEnabled(False)
-        self.select_folder_btn.setEnabled(False)  # Disable folder selection during monitoring
+        self.ui.start_btn.setEnabled(False)
+        self.ui.stop_btn.setEnabled(True)
+        self.ui.connect_btn.setEnabled(False)
+        self.ui.select_folder_btn.setEnabled(False)  # Disable folder selection during monitoring
         self.log_message("Monitoring started")
         
+        # Update UI status indicator
+        self.ui.set_monitoring_status(True)
+    
         # Add notification
         self.notification_manager.monitoring_started(os.path.basename(folder_path))
 
-    # Update stop_monitoring method
     def stop_monitoring(self):
         if self.monitor_thread:
             self.monitor_thread.stop()
@@ -795,12 +523,15 @@ class AttendanceMonitorApp(QMainWindow):
             self.monitor_thread = None
         
         # Fix: Use a boolean check instead of passing the connection object
-        self.start_btn.setEnabled(self.db_manager is not None and self.db_manager.conn is not None)
-        self.stop_btn.setEnabled(False)
-        self.connect_btn.setEnabled(True)
-        self.select_folder_btn.setEnabled(True)  # Re-enable folder selection when monitoring stops
+        self.ui.start_btn.setEnabled(self.db_manager is not None and self.db_manager.conn is not None)
+        self.ui.stop_btn.setEnabled(False)
+        self.ui.connect_btn.setEnabled(True)
+        self.ui.select_folder_btn.setEnabled(True)  # Re-enable folder selection when monitoring stops
         self.log_message("Monitoring stopped")
         
+        # Update UI status indicator
+        self.ui.set_monitoring_status(False)
+    
         # Add notification
         self.notification_manager.monitoring_stopped()
 
@@ -809,11 +540,9 @@ class AttendanceMonitorApp(QMainWindow):
         self.save_settings()
         
         # Ask if user wants to quit or minimize to tray
-        reply = QMessageBox.question(
-            self, 'Exit Confirmation',
-            'Do you want to quit the application ?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.No
+        reply = self.ui.show_question_dialog(
+            'Exit Confirmation',
+            'Do you want to quit the application ?'
         )
         
         if reply == QMessageBox.StandardButton.Yes:
@@ -821,10 +550,10 @@ class AttendanceMonitorApp(QMainWindow):
             if self.monitor_thread:
                 self.stop_monitoring()
             event.accept()
-            QApplication.quit()
+            QApplication.instance().quit()
         elif reply == QMessageBox.StandardButton.No:
             # Minimize to system tray
-            self.hide()
+            self.ui.hide()
             event.ignore()
         else:
             # Cancel
@@ -860,19 +589,21 @@ class AttendanceMonitorApp(QMainWindow):
             self.monitor_thread = None
         
         # Properly clean up database connection
-        if self.db_manager and self.db_manager.conn:
+        if self.db_manager:
             try:
-                self.db_manager.conn.close()
-                self.log_message("Database connection closed")
+                if self.db_manager.close():
+                    self.log_message("Database connection closed")
+                else:
+                    self.log_message("Error closing database connection")
             except Exception as e:
                 self.log_message(f"Error closing database connection: {str(e)}")
-        
+    
         # Hide tray icon before quitting
         try:
-            self.tray_icon.hide()
+            self.ui.tray_icon.hide()
         except:
             pass
-        
+    
         # Ensure all resources are released
         try:
             proc = psutil.Process()
@@ -921,29 +652,172 @@ class AttendanceMonitorApp(QMainWindow):
             # Silently handle errors in resource monitoring
             pass
 
+    def change_filter_type(self, index):
+        """Change the filter type based on the dropdown selection"""
+        self.ui.filter_stack.setCurrentIndex(index)
+        
+        # If employee ID is selected and we have a DB connection, try to load suggestions
+        if index == 1 and self.db_manager and self.db_manager.conn:
+            self.load_employee_suggestions()
+
+    def load_employee_suggestions(self):
+        """Load employee ID suggestions from the database"""
+        if not self.db_manager or not self.db_manager.conn:
+            return
+            
+        try:
+            results = self.db_manager.get_employee_suggestions()
+            
+            # Store employee data for autocomplete
+            self.employee_suggestions = []
+            
+            for emp_id, emp_name in results:
+                self.employee_suggestions.append((emp_id, f"{emp_id} - {emp_name}"))
+                
+            self.log_message(f"Loaded {len(self.employee_suggestions)} employee suggestions")
+        except Exception as e:
+            self.log_message(f"Error loading employee suggestions: {str(e)}")
+
+    def query_database(self):
+        """Query the database with the selected filter"""
+        if not self.db_manager or not self.db_manager.conn:
+            self.ui.show_warning_dialog("Database Error", "Not connected to database")
+            return
+        
+        try:
+            filter_type = self.ui.filter_type.currentIndex()
+            
+            # Query using the appropriate method based on filter type
+            if filter_type == 0:  # Date
+                selected_date = self.ui.date_filter.date().toString("yyyy-MM-dd")
+                results, columns = self.db_manager.query_by_date(selected_date)
+                filter_desc = f"Date: {selected_date}"
+                
+            else:  # Employee ID
+                # Get the employee ID from the text field
+                employee_id = self.ui.employee_id_filter.text().strip()
+                
+                if not employee_id:
+                    self.ui.show_warning_dialog("Input Error", "Please enter an Employee ID")
+                    return
+                    
+                results, columns = self.db_manager.query_by_employee_id(employee_id)
+                filter_desc = f"Employee ID: {employee_id}"
+    
+            # Update the results table
+            self.ui.set_results_table_data(results, columns)
+            
+            # Switch to the database tab
+            self.ui.tab_widget.setCurrentIndex(1)
+            
+            self.log_message(f"Executed query with filter: {filter_desc}")
+            
+            if not results or len(results) == 0:
+                self.log_message(f"Query completed: No data found for {filter_desc}")
+                     
+        except Exception as e:
+            self.ui.show_error_dialog("Query Error", f"Error querying database: {str(e)}")
+            self.log_message(f"Database query error: {str(e)}")
+
+    def export_results(self):
+        """Export the current table results to CSV or Excel"""
+        if self.ui.results_table.rowCount() == 0:
+            self.ui.show_message_box("Export", "No data to export")
+            return
+        
+        # Ask for file location
+        file_path, selected_filter = self.ui.get_save_file_dialog(
+            "Export Results", 
+            os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation), 
+                        f"attendance_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
+            "CSV Files (*.csv);;Excel Files (*.xlsx)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Get table data from UI
+            headers, data = self.ui.get_table_data()
+            
+            # Export based on file extension
+            if file_path.lower().endswith('.csv'):
+                import csv
+                with open(file_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    writer.writerows(data)
+            elif file_path.lower().endswith('.xlsx'):
+                import openpyxl
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.append(headers)
+                for row_data in data:
+                    ws.append(row_data)
+                wb.save(file_path)
+            else:
+                # Add default extension if none provided
+                if "csv" in selected_filter.lower():
+                    file_path += ".csv"
+                    import csv
+                    with open(file_path, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(headers)
+                        writer.writerows(data)
+                else:
+                    file_path += ".xlsx"
+                    import openpyxl
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.append(headers)
+                    for row_data in data:
+                        ws.append(row_data)
+                    wb.save(file_path)
+            
+            self.log_message(f"Exported {self.ui.results_table.rowCount()} records to {file_path}")
+            self.ui.show_message_box("Export Successful", f"Data exported to {file_path}")
+            
+        except Exception as e:
+            self.ui.show_error_dialog("Export Error", f"Error exporting data: {str(e)}")
+            self.log_message(f"Export error: {str(e)}")
+
 def create_default_icon():
-    """Create a default icon if logo.png doesn't exist"""
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib import colors
-    from PIL import Image
+    """Create a default icon if logo.png doesn't exist using PyQt6"""
+    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QBrush
+    from PyQt6.QtCore import Qt, QRect
     
     icon_path = resource_path("logo.png")
     if not os.path.exists(icon_path):
         try:
-            c = canvas.Canvas("temp_logo.pdf", pagesize=(256, 256))
-            c.setFillColor(colors.blue)
-            c.rect(0, 0, 256, 256, fill=1)
-            c.setFillColor(colors.white)
-            c.setFont("Helvetica", 40)
-            c.drawCentredString(128, 128, "AM")
-            c.save()
+            # Create a pixmap with blue background
+            pixmap = QPixmap(256, 256)
+            pixmap.fill(QColor(0, 120, 215))  # Windows blue color
             
-            img = Image.open("temp_logo.pdf")
-            img.save(icon_path)
-            os.remove("temp_logo.pdf")
+            # Create painter to draw on the pixmap
+            painter = QPainter(pixmap)
+            
+            # Set up font
+            font = QFont("Arial", 80, QFont.Weight.Bold)
+            painter.setFont(font)
+            
+            # Set text color to white
+            painter.setPen(Qt.GlobalColor.white)
+            
+            # Draw text centered
+            rect = QRect(0, 0, 256, 256)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "AM")
+            
+            # End painting
+            painter.end()
+            
+            # Save to file
+            pixmap.save(icon_path, "PNG")
+            
+            return True
         except Exception as e:
             print(f"Failed to create default icon: {str(e)}")
+            return False
+    return True
 
 if __name__ == "__main__":
     # Check if another instance is already running
@@ -960,13 +834,17 @@ if __name__ == "__main__":
     create_default_icon()
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    window = AttendanceMonitorApp()
-    window.show()
     
-    # Add to top of main function (just before app.exec())
+    # Create the application instance
+    attendance_app = AttendanceMonitorApp()
+    
+    # Show the main window
+    attendance_app.ui.window.show()
+    
+    # Schedule startup notification
     def show_startup_notification():
-        window.notification_manager.app_started()
-        window.log_message("Application started")
+        attendance_app.notification_manager.app_started()
+        attendance_app.log_message("Application started")
 
     # Schedule startup notification with slight delay to ensure UI is ready
     QTimer.singleShot(1000, show_startup_notification)

@@ -18,9 +18,12 @@ for folder in ['build', 'dist']:
 if not os.path.exists('logo.ico'):
     print("Creating logo.ico from logo.png...")
     try:
-        from PIL import Image
-        img = Image.open('logo.png')
-        img.save('logo.ico')
+        # Use PyQt6 to create the icon instead of PIL
+        from PyQt6.QtGui import QIcon, QPixmap
+        pixmap = QPixmap('logo.png')
+        icon = QIcon(pixmap)
+        # Save as .ico (this is a simplified approach - in practice use a converter)
+        print("Warning: Using logo.png directly; consider converting to .ico format")
     except:
         print("Warning: Couldn't create logo.ico, will use default icon")
 
@@ -39,11 +42,8 @@ hidden_imports = [
     'PyQt6.QtWidgets',
     'PyQt6.QtCore', 
     'PyQt6.QtGui',
-    'openpyxl',
-    'reportlab.lib.pagesizes',
-    'reportlab.pdfgen',
-    'reportlab.lib.colors',
-    'PIL.Image'
+    'openpyxl'
+    # Removed: 'reportlab.lib.pagesizes', 'reportlab.pdfgen', 'reportlab.lib.colors', 'PIL.Image'
 ]
 
 print("Starting PyInstaller build process...")

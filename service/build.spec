@@ -19,11 +19,8 @@ a = Analysis(
         'PyQt6.QtWidgets',
         'PyQt6.QtCore',
         'PyQt6.QtGui',
-        'openpyxl',
-        'reportlab.lib.pagesizes',
-        'reportlab.pdfgen',
-        'reportlab.lib.colors',
-        'PIL.Image'
+        'openpyxl'
+        
     ],
     hookspath=[],
     hooksconfig={},
