@@ -1,0 +1,18 @@
+# Required packages for Attendance Monitor application
+pandas        # For Excel file processing and data manipulation
+PyQt6          # UI framework
+pyodbc       # SQL Server connection
+watchdog      # File system monitoring
+winotify     # Windows notifications
+openpyxl      # Excel file handling (needed by pandas)
+Pillow       # Image processing (for icon handling)
+reportlab      # For creating default icon
+pyinstaller   # For building the executable
+pywin32         # Windows API access for improved file handling
+psutil         # Process utilities for monitoring app resources
+
+# Installation instructions:
+# 1. Create a virtual environment: python -m venv venv
+# 2. Activate it: venv\Scripts\activate
+# 3. Install packages: pip install -r req.txt
+# 4. Build application: python build.py

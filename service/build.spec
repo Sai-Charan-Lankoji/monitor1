@@ -7,14 +7,23 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('logo.png', '.')
+        ('logo.png', '.'),
+        ('version.txt', '.')
     ],
     hiddenimports=[
         'watchdog.observers',
+        'watchdog.observers.polling',
         'winotify',
         'pyodbc',
         'pandas',
-        'PyQt6.QtWidgets'
+        'PyQt6.QtWidgets',
+        'PyQt6.QtCore',
+        'PyQt6.QtGui',
+        'openpyxl',
+        'reportlab.lib.pagesizes',
+        'reportlab.pdfgen',
+        'reportlab.lib.colors',
+        'PIL.Image'
     ],
     hookspath=[],
     hooksconfig={},
@@ -41,10 +50,10 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=False,  # Set to True temporarily for debugging
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch='x86_64',  # Explicitly specify architecture
     codesign_identity=None,
     entitlements_file=None,
     icon='logo.ico',
